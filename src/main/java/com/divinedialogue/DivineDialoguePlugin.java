@@ -54,9 +54,10 @@ public class DivineDialoguePlugin extends Plugin
     /** Last known overlay location we persisted, used to detect user drags. */
     private Point lastKnownLocation = null;
 
-    /** Preloads and plays typewriter sound effects with pitch variation. */
+    /** Plays typewriter sound effects through RuneLite's AudioPlayer. */
+    @Inject
     @Getter
-    private final SoundPlayer soundPlayer = new SoundPlayer();
+    private SoundPlayer soundPlayer;
 
     @Provides
     DivineDialogueConfig provideConfig(ConfigManager configManager)
@@ -68,7 +69,6 @@ public class DivineDialoguePlugin extends Plugin
     protected void startUp()
     {
         loadFonts();
-        soundPlayer.loadAll(getClass().getClassLoader());
         overlay.setPlugin(this);
         overlayManager.add(overlay);
         applySavedPosition();

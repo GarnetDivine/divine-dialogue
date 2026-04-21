@@ -1,307 +1,223 @@
 /*
- * Copyright (c) 2025, O3 Studios / Garnet Divine
+ * Copyright (c) 2026, O3 Studios / Garnet Divine
  * All rights reserved.
  */
 package com.divinedialogue;
 
+import javax.inject.Inject;
+import javax.inject.Singleton;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.EnumMap;
-import java.util.EnumSet;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
-import javax.sound.sampled.AudioFormat;
-import javax.sound.sampled.AudioInputStream;
-import javax.sound.sampled.AudioSystem;
-import javax.sound.sampled.Clip;
-import javax.sound.sampled.DataLine;
-import javax.sound.sampled.FloatControl;
-import javax.sound.sampled.LineEvent;
-import javax.sound.sampled.LineUnavailableException;
-import javax.sound.sampled.SourceDataLine;
-import javax.sound.sampled.UnsupportedAudioFileException;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.audio.AudioPlayer;
 
 /**
- * Preloads typewriter WAV samples into byte buffers at startup, then plays them
- * on demand with a small random pitch offset (via sample-rate shift) and a configurable
- * volume.
+ * Wrapper around RuneLite's {@link AudioPlayer} for typewriter click playback.
  *
- * <p>Playback strategy: try a non-blocking {@link Clip} at the (optionally pitch-shifted)
- * format first. If the mixer rejects the format — common on Windows drivers that only
- * advertise a few discrete sample rates — fall back to the original unshifted format,
- * then to a {@link SourceDataLine} path as a last resort. A typewriter that clicks
- * without pitch variation is better than a silent one.</p>
+ * <p>Each {@link TypewriterSound} option carries a list of variant sample paths.
+ * On every play, we pick one variant at random — this substitutes for the per-play
+ * pitch variation we used to do manually, producing the same natural feel without
+ * touching {@code javax.sound} APIs directly (banned by the Plugin Hub policy
+ * scanner).</p>
  *
- * <p>Load failures and playback failures are logged at WARN once per sound, so
- * breakage surfaces in the RuneLite log even at default log levels.</p>
+ * <p>WAV samples are <em>preloaded into memory</em> on first play and held as
+ * {@code byte[]} buffers. On each play, we wrap the bytes in a fresh
+ * {@link ByteArrayInputStream} and hand it to {@link AudioPlayer#play(InputStream, float)}.
+ * This matters for two reasons:
+ * <ul>
+ *   <li>The {@code play(Class, String, float)} overload can return "Stream closed"
+ *       errors in certain classpath configurations (particularly when resources
+ *       live inside a nested jar). Passing our own {@code InputStream} sidesteps
+ *       that entire code path.</li>
+ *   <li>At ~14 KB per WAV × 8 variants = ~112 KB total, the memory cost is
+ *       negligible and we avoid re-reading from disk/jar on every keystroke.</li>
+ * </ul>
+ *
+ * <p>Volume is mapped from the config's 0-100 scale into a dB gain via a
+ * logarithmic taper so the slider feels linear to the ear.</p>
  */
 @Slf4j
+@Singleton
 public class SoundPlayer
 {
-    /** Max fractional pitch offset. 0.08 = ±8% which sounds like natural typewriter key variation. */
-    private static final float PITCH_RANGE = 0.08f;
+    /** Minimum dB to apply when volume is above zero. Below this, human hearing loses it anyway. */
+    private static final float MIN_GAIN_DB = -40f;
 
-    /** Decoded raw audio bytes per sound, keyed by config enum. Null when not loaded. */
-    private final Map<TypewriterSound, byte[]> audioBytes = new EnumMap<>(TypewriterSound.class);
-    /** Original AudioFormat for each loaded sample. */
-    private final Map<TypewriterSound, AudioFormat> formats = new EnumMap<>(TypewriterSound.class);
-    /** Sounds we've already logged a playback failure for — prevents log spam. */
-    private final Set<TypewriterSound> failureWarned = EnumSet.noneOf(TypewriterSound.class);
-    /** Sounds we've already logged the first play attempt for — diagnostic, prevents spam. */
-    private final Set<TypewriterSound> firstPlayLogged = EnumSet.noneOf(TypewriterSound.class);
-
+    private final AudioPlayer audioPlayer;
     private final Random random = new Random();
 
-    /**
-     * Loads all non-NONE typewriter sounds from the classloader. Safe to call on plugin
-     * startup. If a resource is missing or malformed, a warning is logged and that sound
-     * entry is skipped (attempts to play it later become no-ops).
-     */
-    public void loadAll(ClassLoader classLoader)
-    {
-        for (TypewriterSound sound : TypewriterSound.values())
-        {
-            String path = sound.getResourcePath();
-            if (path == null)
-            {
-                continue;
-            }
-            try (InputStream in = classLoader.getResourceAsStream(path))
-            {
-                if (in == null)
-                {
-                    log.warn("Typewriter sound missing: {} — option disabled.", path);
-                    continue;
-                }
-                // Decode once so we can replay without re-reading the file each time.
-                try (AudioInputStream ais = AudioSystem.getAudioInputStream(new ByteArrayInputStream(readAll(in))))
-                {
-                    AudioFormat fmt = ais.getFormat();
-                    byte[] raw = readAll(ais);
-                    audioBytes.put(sound, raw);
-                    formats.put(sound, fmt);
-                    log.debug("Loaded typewriter sound {}: {} bytes, {}", path, raw.length, fmt);
-                }
-            }
-            catch (UnsupportedAudioFileException e)
-            {
-                log.warn("Typewriter sound {} is not a supported WAV format ({}). "
-                    + "Re-export as 16-bit PCM WAV in Audacity.", path, e.getMessage());
-            }
-            catch (IOException e)
-            {
-                log.warn("Failed to read typewriter sound {}: {}", path, e.getMessage());
-            }
-            catch (Exception e)
-            {
-                log.warn("Unexpected error loading {}: {}", path, e.getMessage());
-            }
-        }
+    /** Preloaded WAV bytes, keyed by resource path. Populated lazily on first play. */
+    private final Map<String, byte[]> audioCache = new HashMap<>();
+    /** Paths we've tried and failed to load — skip these instead of retrying forever. */
+    private final Set<String> loadFailed = new HashSet<>();
 
-        // Startup summary — logged at DEBUG so developers can confirm which samples
-        // successfully loaded if they turn on debug logging, but doesn't pollute the
-        // default user log.
-        log.debug("Divine Dialogue typewriter sounds loaded: {} / {}. Formats: {}",
-            audioBytes.size(),
-            TypewriterSound.values().length - 1, // minus NONE
-            formats);
+    /** Variants we've already logged a playback failure for — prevents log spam. */
+    private final Set<String> pathFailureWarned = new HashSet<>();
+
+    private boolean preloaded = false;
+
+    @Inject
+    public SoundPlayer(AudioPlayer audioPlayer)
+    {
+        this.audioPlayer = audioPlayer;
     }
 
     /**
-     * Plays the given sound once with a random pitch offset in the range ±{@value #PITCH_RANGE}.
-     * On any playback failure, falls back to unshifted format, then to SourceDataLine.
+     * Plays one randomly-picked variant of the given sound at the specified volume.
      *
-     * @param sound  which sound to play; NONE or unloaded sounds are silently ignored
-     * @param volume 0–100; values outside this range are clamped
+     * @param sound  which sound to play; NONE or sounds with no variants are silently ignored
+     * @param volume 0–100; 0 is silent (skipped entirely), values are clamped to range
      */
     public void play(TypewriterSound sound, int volume)
     {
+        preloadOnce();
+
         if (sound == null || sound == TypewriterSound.NONE)
         {
             return;
         }
-        byte[] raw = audioBytes.get(sound);
-        AudioFormat baseFormat = formats.get(sound);
-        if (raw == null || baseFormat == null)
+        List<String> variants = sound.getVariantPaths();
+        if (variants == null || variants.isEmpty())
+        {
+            return;
+        }
+        int clamped = Math.max(0, Math.min(100, volume));
+        if (clamped == 0)
         {
             return;
         }
 
-        // Once per sound, log that we've been asked to play it. DEBUG-level so it
-        // doesn't spam user logs, but stays available for diagnosing issues.
-        if (firstPlayLogged.add(sound))
+        // Filter to variants that actually loaded successfully.
+        List<String> available = new ArrayList<>(variants.size());
+        for (String path : variants)
         {
-            log.debug("Divine Dialogue: first play attempt for {} (volume={}, format={})",
-                sound, volume, baseFormat);
+            if (audioCache.containsKey(path))
+            {
+                available.add(path);
+            }
         }
-
-        // Shift sample rate by a small random amount — audio hardware interprets
-        // the same bytes faster/slower, which shifts perceived pitch.
-        float shift = 1.0f + ((random.nextFloat() * 2f - 1f) * PITCH_RANGE);
-        AudioFormat shifted = new AudioFormat(
-            baseFormat.getEncoding(),
-            baseFormat.getSampleRate() * shift,
-            baseFormat.getSampleSizeInBits(),
-            baseFormat.getChannels(),
-            baseFormat.getFrameSize(),
-            baseFormat.getFrameRate() * shift,
-            baseFormat.isBigEndian()
-        );
-
-        // Attempt 1: Clip with pitch-shifted format. Fastest path when it works.
-        if (tryPlayClip(raw, shifted, volume))
+        if (available.isEmpty())
         {
             return;
         }
 
-        // Attempt 2: Clip with original format (pitch variation lost, but audible).
-        if (tryPlayClip(raw, baseFormat, volume))
+        String path = available.get(random.nextInt(available.size()));
+        byte[] bytes = audioCache.get(path);
+        float gain = volumeToGainDb(clamped);
+
+        // Wrap in a fresh ByteArrayInputStream each play — AudioPlayer may close
+        // the stream after reading, so it must be re-created per invocation.
+        try (InputStream stream = new ByteArrayInputStream(bytes))
         {
-            return;
-        }
-
-        // Attempt 3: SourceDataLine with original format. Most compatible, spawns
-        // a throwaway thread per play (fine at ~5 plays/sec throttle).
-        if (tryPlaySourceDataLine(sound, raw, baseFormat, volume))
-        {
-            return;
-        }
-
-        // All paths exhausted — warn once per sound so the log doesn't flood.
-        if (failureWarned.add(sound))
-        {
-            log.warn("Typewriter sound {} could not be played by any audio path. "
-                + "Check that your audio drivers support {} Hz, {}-bit, {}-channel PCM.",
-                sound, baseFormat.getSampleRate(), baseFormat.getSampleSizeInBits(), baseFormat.getChannels());
-        }
-    }
-
-    private boolean tryPlayClip(byte[] raw, AudioFormat format, int volume)
-    {
-        try
-        {
-            AudioInputStream stream = new AudioInputStream(
-                new ByteArrayInputStream(raw), format,
-                raw.length / Math.max(1, format.getFrameSize()));
-
-            Clip clip = AudioSystem.getClip();
-            clip.open(stream);
-            applyClipVolume(clip, volume);
-
-            // Release clip resources when playback finishes so we don't leak them.
-            clip.addLineListener(evt -> {
-                if (evt.getType() == LineEvent.Type.STOP)
-                {
-                    clip.close();
-                }
-            });
-
-            clip.start();
-            return true;
-        }
-        catch (LineUnavailableException | IllegalArgumentException e)
-        {
-            // LineUnavailable: driver can't open a line at this format (common with
-            // pitch-shifted sample rates). IllegalArgumentException: format outright
-            // unsupported. Either way, caller will try the next fallback.
-            log.debug("Clip path rejected format {}: {}", format, e.getMessage());
-            return false;
+            audioPlayer.play(stream, gain);
         }
         catch (Exception e)
         {
-            log.debug("Clip path unexpected failure: {}", e.getMessage());
-            return false;
+            // AudioPlayer.play() declares IOException, UnsupportedAudioFileException,
+            // and LineUnavailableException — all from javax.sound.sampled. We catch
+            // Exception generically to avoid importing javax.sound.sampled types into
+            // plugin code, which is restricted by the Plugin Hub policy scanner.
+            if (pathFailureWarned.add(path))
+            {
+                log.warn("Divine Dialogue: could not play typewriter sound variant {} ({}): {}. "
+                    + "Ensure the WAV is 16-bit PCM and your audio drivers are working.",
+                    sound, path, e.getMessage());
+            }
         }
     }
 
-    private boolean tryPlaySourceDataLine(TypewriterSound sound, byte[] raw, AudioFormat format, int volume)
+    /**
+     * On first play() call, read every declared variant WAV into an in-memory
+     * byte buffer. This pays the I/O cost once at startup and leaves playback
+     * as a simple memory-to-mixer copy. Runs exactly once per plugin lifetime.
+     */
+    private void preloadOnce()
     {
-        DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
-        if (!AudioSystem.isLineSupported(info))
-        {
-            return false;
-        }
-        try
-        {
-            SourceDataLine line = (SourceDataLine) AudioSystem.getLine(info);
-            line.open(format);
-            applyLineVolume(line, volume);
-            line.start();
-
-            // Write + drain + close on a background thread so we don't block the render pass.
-            // At ~5 plays/sec throttle and ~80ms clip length, these threads come and go quickly.
-            Thread t = new Thread(() -> {
-                try
-                {
-                    line.write(raw, 0, raw.length);
-                    line.drain();
-                }
-                catch (Exception ignored) { }
-                finally
-                {
-                    try { line.close(); } catch (Exception ignored) { }
-                }
-            }, "DivineDialogue-Sound-" + sound);
-            t.setDaemon(true);
-            t.start();
-            return true;
-        }
-        catch (Exception e)
-        {
-            log.debug("SourceDataLine path failed: {}", e.getMessage());
-            return false;
-        }
-    }
-
-    private static void applyClipVolume(Clip clip, int volumePct)
-    {
-        applyGain(clip.isControlSupported(FloatControl.Type.MASTER_GAIN)
-            ? (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN)
-            : null, volumePct);
-    }
-
-    private static void applyLineVolume(SourceDataLine line, int volumePct)
-    {
-        applyGain(line.isControlSupported(FloatControl.Type.MASTER_GAIN)
-            ? (FloatControl) line.getControl(FloatControl.Type.MASTER_GAIN)
-            : null, volumePct);
-    }
-
-    private static void applyGain(FloatControl gain, int volumePct)
-    {
-        if (gain == null)
+        if (preloaded)
         {
             return;
         }
-        float pct = Math.max(0, Math.min(100, volumePct)) / 100f;
-        // Map 0..1 linearly into a sensible dB range. -40dB ≈ inaudible, 0dB ≈ unchanged.
-        // Anything above 0 risks clipping, so we cap at 0.
-        float db;
-        if (pct <= 0f)
+        preloaded = true;
+
+        List<String> loaded = new ArrayList<>();
+        for (TypewriterSound sound : TypewriterSound.values())
         {
-            db = gain.getMinimum();
+            for (String path : sound.getVariantPaths())
+            {
+                if (audioCache.containsKey(path) || loadFailed.contains(path))
+                {
+                    continue;
+                }
+                byte[] bytes = readResource(path);
+                if (bytes != null)
+                {
+                    audioCache.put(path, bytes);
+                    loaded.add(path);
+                }
+                else
+                {
+                    loadFailed.add(path);
+                }
+            }
         }
-        else
-        {
-            db = (float) (20.0 * Math.log10(pct));
-            if (db < gain.getMinimum()) db = gain.getMinimum();
-            if (db > gain.getMaximum()) db = gain.getMaximum();
-        }
-        gain.setValue(db);
+        log.debug("Divine Dialogue: preloaded {} typewriter samples ({}). Failed: {}.",
+            loaded.size(), loaded, loadFailed);
     }
 
-    private static byte[] readAll(InputStream in) throws IOException
+    /** Reads a classpath resource into a byte array. Returns null if missing or unreadable. */
+    private static byte[] readResource(String path)
     {
-        byte[] buf = new byte[8192];
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        int n;
-        while ((n = in.read(buf)) != -1)
+        try (InputStream in = SoundPlayer.class.getClassLoader().getResourceAsStream(path))
         {
-            out.write(buf, 0, n);
+            if (in == null)
+            {
+                log.warn("Divine Dialogue: typewriter sound resource missing: {}", path);
+                return null;
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1)
+            {
+                out.write(buf, 0, n);
+            }
+            return out.toByteArray();
         }
-        return out.toByteArray();
+        catch (IOException e)
+        {
+            log.warn("Divine Dialogue: failed to read typewriter sound resource {}: {}",
+                path, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Maps the config's 0-100 volume slider to a dB gain value.
+     * 0 is handled upstream (skip). 100 → 0 dB (no change). Between, a logarithmic
+     * taper: 50 → -6 dB (half perceived loudness), 10 → -20 dB, etc.
+     * Clamped at {@link #MIN_GAIN_DB} on the low end.
+     */
+    private static float volumeToGainDb(int volumePct)
+    {
+        float pct = volumePct / 100f;
+        float db = (float) (20.0 * Math.log10(pct));
+        if (db < MIN_GAIN_DB)
+        {
+            db = MIN_GAIN_DB;
+        }
+        if (db > 0f)
+        {
+            db = 0f;
+        }
+        return db;
     }
 }
